@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+.env
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# 权重与导出（大文件；需要请用 Git LFS 或单独分发）
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.weights
+
+# 数据与压缩包（VOC 等体积大）
+data/VOCdevkit/
+data/**/*.tar
+data/**/*.tar.gz
+data/**/*.zip
+# YOLO 格式由脚本从 VOC 生成；勿提交上万标签/整集图片（仓库体积与推送速度）
+data/voc2007_yolo/images/
+data/voc2007_yolo/labels/
+
+# 实验输出
+voc_outputs*/
+adv_outputs*/
+runs/
+noise_previews/
+
+# 预览图（可选忽略；若需保留预览可删下一行）
+# *.png
+# *.jpg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 日志
+*.log
