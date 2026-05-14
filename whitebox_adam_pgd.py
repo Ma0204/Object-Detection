@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-白盒攻击（VOC + YOLO）：脚本名仍为 whitebox_mifgsm.py，内核为 **L∞ Adam-PGD**，
-针对检测比经典 MI-FGSM（梯度逐像素归一化 + 简单动量）更稳、通常更易拉高 GT-ASR。
+白盒攻击（VOC + YOLO）：**L∞ Adam-PGD**（`det_adam_pgd_attack`），最小化 `yolo_whitebox_objective`。
 
+- 与经典 MI-FGSM（逐像素梯度归一化 + 动量）不同；本脚本对应方法为 Adam 一阶矩 EMA + sign 的 PGD 变体。
 - 目标：最小化 `yolo_whitebox_objective`（与 FGSM/PGD 一致的可微 surrogate）。
 - 更新：Adam 一阶矩 m 对梯度 EMA，bias-correct 后取 sign，每步 L∞ 投影 + [0,1] 裁剪。
 - 约束：eps 默认 0.05，与项目 L∞ 要求一致；评估仍为 infer_yolo + conf + IoU 的 GT-ASR。
@@ -246,7 +246,7 @@ def evaluate_once(model, dataset, args, run_id: int):
 
 def main():
     p = argparse.ArgumentParser(
-        description="VOC YOLO 白盒（脚本名 mifgsm；内核为 L∞ Adam-PGD + yolo_whitebox_objective）"
+        description="VOC YOLO 白盒：L∞ Adam-PGD（det_adam_pgd_attack）+ yolo_whitebox_objective"
     )
     p.add_argument("--eps", type=float, default=0.05)
     p.add_argument("--steps", type=int, default=100)
@@ -261,7 +261,7 @@ def main():
         "--mu",
         type=float,
         default=None,
-        help="已弃用：若指定则覆盖 --beta1，兼容旧命令（原 MI-FGSM 动量参数）",
+        help="已弃用：若指定则覆盖 --beta1，兼容旧命令（历史别名）",
     )
     p.add_argument(
         "--topk",
@@ -299,7 +299,7 @@ def main():
     p.add_argument("--num_eval", type=int, default=500)
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--load_model", type=str, required=True)
-    p.add_argument("--outdir", type=str, default="./adv_outputs/mifgsm")
+    p.add_argument("--outdir", type=str, default="./adv_outputs/adam_pgd")
     p.add_argument("--log_every", type=int, default=20)
     args = p.parse_args()
     if getattr(args, "mu", None) is not None:
@@ -350,7 +350,7 @@ def main():
 
     asr = np.array([r["gt_asr"] for r in all_r])
     print("\n" + "=" * 60)
-    print("AdamPGD 检测白盒汇总（原 whitebox_mifgsm 入口）")
+    print("AdamPGD 检测白盒汇总（whitebox_adam_pgd）")
     print("=" * 60)
     print(f"攻击成功率(GT级)均值: {asr.mean()*100:.2f}%")
     print(f"是否满足 >85%: {asr.mean() > 0.85}")

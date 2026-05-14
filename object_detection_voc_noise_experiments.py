@@ -2,7 +2,8 @@
 """
 VOC2007 噪声鲁棒性实验（YOLO 版本）
 
-加噪后默认将扰动限制在 L∞ 半径内（与对抗攻击 eps 语义一致），可用 --linf_eps 调整；≤0 关闭。
+加噪后默认将扰动限制在 L∞ 半径内（与对抗 eps 一致），可用 --linf_eps 调整；≤0 关闭。
+高斯/椒盐在 linf_eps>0 时在球内原生生成；椒盐 B×B 块按边缘显著性抽块，并对块权重做低通调制（类高斯 lowfreq 成簇）；块内 RGB 可独立 ±ε。雨丝单独更高 L∞（--rain_cap_max / --rain_linf_mult）、更密主 pass + 第二遍短丝（--rain_second_pass）、更长线段（--rain_length）；随机噪声 ASR 仍随模型与抽样波动，不保证固定 40%。
 """
 
 import os
@@ -12,6 +13,7 @@ import math
 from typing import List, Dict, Tuple, Optional
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from PIL import ImageDraw
 from torchvision import transforms
@@ -63,25 +65,183 @@ def apply_linf_noise_cap(
     return (img_clean + d).clamp(0.0, 1.0)
 
 
+def _luminance_sobel_mag_hw(img_chw: torch.Tensor) -> torch.Tensor:
+    """灰度 Sobel 幅值 [H,W]，与 img 同 device/dtype。"""
+    gray = (0.2989 * img_chw[0] + 0.5870 * img_chw[1] + 0.1140 * img_chw[2]).unsqueeze(0).unsqueeze(0)
+    kx = torch.tensor(
+        [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+        device=img_chw.device,
+        dtype=img_chw.dtype,
+    ).view(1, 1, 3, 3)
+    ky = torch.tensor(
+        [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+        device=img_chw.device,
+        dtype=img_chw.dtype,
+    ).view(1, 1, 3, 3)
+    gx = F.conv2d(gray, kx, padding=1)
+    gy = F.conv2d(gray, ky, padding=1)
+    return torch.sqrt(gx * gx + gy * gy + 1e-8).squeeze(0).squeeze(0)
+
+
 class AddGaussianNoise:
-    def __init__(self, sigma: float = 0.1):
-        self.sigma = sigma
+    """
+    高斯加性噪声。linf_eps>0：δ~N(0,σ²)，可选低分辨率再上采样（结构化），再截断到 ±linf_eps 后 x+δ。
+    linf_eps=0：旧行为 clamp(x+n,0,1)。
+    """
+
+    def __init__(self, sigma: float = 0.1, linf_eps: float = 0.0, lowfreq_downscale: int = 1):
+        self.sigma = float(sigma)
+        self.linf_eps = float(linf_eps)
+        self.lowfreq_downscale = max(1, int(lowfreq_downscale))
 
     def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        if self.linf_eps > 0.0:
+            e = self.linf_eps
+            c_, h_, w_ = img.shape
+            sf = self.lowfreq_downscale
+            if sf > 1:
+                sh = max(1, h_ // sf)
+                sw = max(1, w_ // sf)
+                delta = torch.randn((c_, sh, sw), device=img.device, dtype=img.dtype) * self.sigma
+                delta = F.interpolate(delta.unsqueeze(0), size=(h_, w_), mode="bilinear", align_corners=False).squeeze(0)
+            else:
+                delta = torch.randn_like(img) * self.sigma
+            delta = delta.clamp(-e, e)
+            return (img + delta).clamp(0.0, 1.0)
         noise = torch.randn_like(img) * self.sigma
         return torch.clamp(img + noise, 0.0, 1.0)
 
 
 class AddSaltPepperNoise:
-    def __init__(self, p: float = 0.05):
-        self.p = p
+    """
+    椒盐噪声。
+    - linf_eps=0：0/1 硬翻转（空间掩膜三通道共用）。
+    - linf_eps>0 且 block_size=1：逐位置 ±linf_eps；per_channel 时 RGB 独立掩膜。
+    - linf_eps>0 且 block_size>1：B×B 块为单位 ±linf_eps；默认按梯度显著性加权抽块，并对块权重乘低分辨率随机场上采样（成簇，更类高斯 lowfreq）。
+      块内 RGB 默认独立随机符号（色度扰动更强）。块数 k≈p·总块数。
+    """
+
+    def __init__(
+        self,
+        p: float = 0.05,
+        linf_eps: float = 0.0,
+        per_channel: bool = True,
+        block_size: int = 1,
+        salience_weighted_blocks: bool = True,
+        salience_power: float = 1.35,
+        block_mask_lowfreq: int = 4,
+        independent_channel_signs: bool = True,
+        block_count_gain: float = 1.07,
+    ):
+        self.p = float(p)
+        self.linf_eps = float(linf_eps)
+        self.per_channel = bool(per_channel)
+        self.block_size = max(1, int(block_size))
+        self.salience_weighted_blocks = bool(salience_weighted_blocks)
+        self.salience_power = float(salience_power)
+        self.block_mask_lowfreq = max(1, int(block_mask_lowfreq))
+        self.independent_channel_signs = bool(independent_channel_signs)
+        self.block_count_gain = max(0.5, min(1.5, float(block_count_gain)))
 
     def __call__(self, img: torch.Tensor) -> torch.Tensor:
         c, h, w = img.shape
-        rand = torch.rand((h, w), device=img.device)
         noisy = img.clone()
-        salt = rand < (self.p / 2.0)
-        pepper = (rand >= (self.p / 2.0)) & (rand < self.p)
+        e = float(self.linf_eps)
+        p = self.p
+        B = self.block_size
+
+        if e > 0.0 and B > 1:
+            pad_h = (B - h % B) % B
+            pad_w = (B - w % B) % B
+            img_p = F.pad(img.unsqueeze(0), (0, pad_w, 0, pad_h), mode="reflect").squeeze(0)
+            _, H, W = img_p.shape
+            nbh, nbw = H // B, W // B
+            nblocks = nbh * nbw
+
+            if self.salience_weighted_blocks and nblocks > 0:
+                mag = _luminance_sobel_mag_hw(img_p)
+                mag = mag.view(nbh, B, nbw, B).mean(dim=(1, 3))
+                wblk = torch.clamp(mag, min=1e-6) ** self.salience_power
+                sf = self.block_mask_lowfreq
+                if sf > 1 and nbh >= 2 and nbw >= 2:
+                    sh = max(1, nbh // sf)
+                    sw = max(1, nbw // sf)
+                    aux = torch.rand((1, 1, sh, sw), device=img.device, dtype=img.dtype) * 0.45 + 0.55
+                    aux_up = F.interpolate(aux, size=(nbh, nbw), mode="bilinear", align_corners=False)
+                    wblk = wblk * aux_up.squeeze(0).squeeze(0)
+                flat = wblk.reshape(-1)
+                k = int(round(p * float(nblocks) * self.block_count_gain))
+                k = max(0, min(nblocks, k))
+                if k == 0:
+                    return img.clone()
+                pr = flat / flat.sum()
+                sel = torch.multinomial(pr, num_samples=k, replacement=False)
+                perm = torch.randperm(k, device=img.device)
+                n_salt = k // 2
+                salt_sel = sel[perm[:n_salt]]
+                pep_sel = sel[perm[n_salt:]]
+                d = torch.zeros_like(img_p)
+                if self.independent_channel_signs:
+                    for t in salt_sel:
+                        by = int(t.item()) // nbw
+                        bx = int(t.item()) % nbw
+                        y0, x0 = by * B, bx * B
+                        sgn = torch.randint(0, 2, (c, 1, 1), device=img.device, dtype=img.dtype).float() * 2.0 - 1.0
+                        d[:, y0 : y0 + B, x0 : x0 + B] = sgn * e
+                    for t in pep_sel:
+                        by = int(t.item()) // nbw
+                        bx = int(t.item()) % nbw
+                        y0, x0 = by * B, bx * B
+                        sgn = torch.randint(0, 2, (c, 1, 1), device=img.device, dtype=img.dtype).float() * 2.0 - 1.0
+                        d[:, y0 : y0 + B, x0 : x0 + B] = sgn * e
+                else:
+                    salt_hw = torch.zeros((H, W), dtype=torch.bool, device=img.device)
+                    pep_hw = torch.zeros((H, W), dtype=torch.bool, device=img.device)
+                    by_s = salt_sel // nbw
+                    bx_s = salt_sel % nbw
+                    y0s = by_s * B
+                    x0s = bx_s * B
+                    by_p = pep_sel // nbw
+                    bx_p = pep_sel % nbw
+                    y0p = by_p * B
+                    x0p = bx_p * B
+                    for dy in range(B):
+                        for dx in range(B):
+                            salt_hw[y0s + dy, x0s + dx] = True
+                            pep_hw[y0p + dy, x0p + dx] = True
+                    for i in range(c):
+                        d[i][salt_hw] = e
+                        d[i][pep_hw] = -e
+                out = (img_p + d).clamp(0.0, 1.0)
+                return out[:, :h, :w]
+
+            rand = torch.rand((nbh, nbw), device=img.device)
+            salt_nb = (rand < (p / 2.0)).float().unsqueeze(0).unsqueeze(0)
+            pep_nb = (((rand >= (p / 2.0)) & (rand < p))).float().unsqueeze(0).unsqueeze(0)
+            salt_hw = (F.interpolate(salt_nb, size=(H, W), mode="nearest").squeeze(0).squeeze(0) > 0.5)
+            pep_hw = (F.interpolate(pep_nb, size=(H, W), mode="nearest").squeeze(0).squeeze(0) > 0.5)
+            d = torch.zeros_like(img_p)
+            for i in range(c):
+                d[i][salt_hw] = e
+                d[i][pep_hw] = -e
+            out = (img_p + d).clamp(0.0, 1.0)
+            return out[:, :h, :w]
+
+        if e > 0.0:
+            if self.per_channel:
+                rand = torch.rand((c, h, w), device=img.device)
+            else:
+                rand = torch.rand((h, w), device=img.device)
+            salt = rand < (p / 2.0)
+            pepper = (rand >= (p / 2.0)) & (rand < p)
+            d = torch.zeros_like(img)
+            d[salt] = e
+            d[pepper] = -e
+            return (img + d).clamp(0.0, 1.0)
+
+        rand = torch.rand((h, w), device=img.device)
+        salt = rand < (p / 2.0)
+        pepper = (rand >= (p / 2.0)) & (rand < p)
         for i in range(c):
             noisy[i][salt] = 1.0
             noisy[i][pepper] = 0.0
@@ -89,6 +249,11 @@ class AddSaltPepperNoise:
 
 
 class AddRainNoise:
+    """
+    雨丝：梯度加权主笔画 + 交叉角 + 第二遍随机短丝（提高全图遮挡）；条数×drop_scale×extra；
+    L∞ 裁剪前强 alpha；再裁剪。cap 可与椒盐不同（通常更大）。
+    """
+
     def __init__(
         self,
         drop_count: int = 1200,
@@ -97,32 +262,135 @@ class AddRainNoise:
         angle_deg: float = -15.0,
         intensity: float = 0.35,
         seed: Optional[int] = None,
+        linf_boost: float = 1.0,
+        grad_weighted_starts: bool = True,
+        grad_start_power: float = 1.34,
+        drop_scale_with_grad: float = 1.05,
+        angle_jitter_deg: float = 16.0,
+        length_jitter: float = 0.22,
+        extra_drop_l2_scale: float = 1.0,
+        crosshatch_frac: float = 0.72,
+        crosshatch_deg: float = 78.0,
+        length_boost: float = 1.2,
+        dark_line_frac: float = 0.45,
+        second_pass_frac: float = 0.58,
+        second_length_scale: float = 0.52,
+        second_angle_extra_deg: float = 32.0,
+        linf_fill: float = 0.0,
+        rain_max_primary_drops: int = 0,
     ):
-        self.drop_count = drop_count
-        self.length = length
+        self.drop_count = int(drop_count)
+        self.length = int(length)
         self.thickness = thickness
-        self.angle_deg = angle_deg
-        self.intensity = intensity
+        self.angle_deg = float(angle_deg)
+        self.intensity = float(intensity)
         self.seed = seed
+        self.linf_boost = max(0.0, float(linf_boost))
+        self.grad_weighted_starts = bool(grad_weighted_starts)
+        self.grad_start_power = float(grad_start_power)
+        self.drop_scale_with_grad = float(drop_scale_with_grad)
+        self.angle_jitter_deg = float(angle_jitter_deg)
+        self.length_jitter = float(length_jitter)
+        self.extra_drop_l2_scale = max(0.0, float(extra_drop_l2_scale))
+        self.crosshatch_frac = float(min(1.0, max(0.0, crosshatch_frac)))
+        self.crosshatch_deg = float(crosshatch_deg)
+        self.length_boost = max(0.5, float(length_boost))
+        self.dark_line_frac = float(min(1.0, max(0.0, dark_line_frac)))
+        self.second_pass_frac = float(min(1.0, max(0.0, second_pass_frac)))
+        self.second_length_scale = max(0.15, float(second_length_scale))
+        self.second_angle_extra_deg = float(second_angle_extra_deg)
+        self.linf_fill = max(0.0, float(linf_fill))
+        self.rain_max_primary_drops = max(0, int(rain_max_primary_drops))
+        self._rng = np.random.default_rng(seed)
 
     def __call__(self, img: torch.Tensor) -> torch.Tensor:
         c, h, w = img.shape
         img_pil = transforms.ToPILImage()(img.cpu())
         draw = ImageDraw.Draw(img_pil, mode="RGBA")
-        rng = np.random.default_rng(self.seed)
-        theta = np.deg2rad(self.angle_deg)
-        dx = int(round(self.length * np.cos(theta)))
-        dy = int(round(self.length * np.sin(theta)))
-        alpha = int(max(0, min(255, round(255 * self.intensity))))
-        color = (220, 220, 220, alpha)
-        for _ in range(self.drop_count):
-            x = int(rng.integers(0, max(1, w)))
-            y = int(rng.integers(0, max(1, h)))
+        rng = self._rng
+        eff = min(1.0, float(self.intensity) * self.linf_boost)
+        alpha = int(max(0, min(255, round(255.0 * eff))))
+        color_light = (220, 220, 220, alpha)
+        color_dim = (165, 170, 175, max(24, alpha - 35))
+
+        n_drops = max(1, int(round(float(self.drop_count) * self.extra_drop_l2_scale)))
+        flat_idx: Optional[np.ndarray] = None
+        if self.grad_weighted_starts and h > 2 and w > 2:
+            n_drops = max(1, int(round(float(self.drop_count) * self.drop_scale_with_grad * self.extra_drop_l2_scale)))
+            with torch.no_grad():
+                mag = _luminance_sobel_mag_hw(img).detach().float().cpu().numpy()
+            mag = np.clip(mag, 1e-6, None) ** self.grad_start_power
+            pr = mag.reshape(-1).astype(np.float64)
+            pr /= pr.sum()
+            flat_idx = rng.choice(h * w, size=n_drops, replace=True, p=pr)
+
+        if self.rain_max_primary_drops > 0:
+            n_drops = min(n_drops, self.rain_max_primary_drops)
+        n_cross = int(round(float(n_drops) * self.crosshatch_frac)) if n_drops > 0 else 0
+        n_dark = int(round(float(n_drops) * self.dark_line_frac)) if n_drops > 0 else 0
+
+        for j in range(n_drops):
+            if flat_idx is not None:
+                t = int(flat_idx[j])
+                x = t % w
+                y = t // w
+            else:
+                x = int(rng.integers(0, max(1, w)))
+                y = int(rng.integers(0, max(1, h)))
+            base_ang = self.angle_deg + (self.crosshatch_deg if j < n_cross else 0.0)
+            ang = base_ang + float(rng.uniform(-self.angle_jitter_deg, self.angle_jitter_deg))
+            ln = (
+                float(self.length)
+                * self.length_boost
+                * float(rng.uniform(max(0.35, 1.0 - self.length_jitter), 1.0 + self.length_jitter))
+            )
+            theta = np.deg2rad(ang)
+            dx = int(round(ln * np.cos(theta)))
+            dy = int(round(ln * np.sin(theta)))
             x2 = int(max(0, min(w - 1, x + dx)))
             y2 = int(max(0, min(h - 1, y + dy)))
-            draw.line([(x, y), (x2, y2)], fill=color, width=self.thickness)
-        noisy = transforms.ToTensor()(img_pil)
-        return torch.clamp(noisy, 0.0, 1.0)
+            if j < n_dark:
+                col = color_dim
+            else:
+                col = color_light
+            draw.line([(x, y), (x2, y2)], fill=col, width=self.thickness)
+
+        n2 = int(round(float(n_drops) * self.second_pass_frac))
+        for j in range(n2):
+            x = int(rng.integers(0, max(1, w)))
+            y = int(rng.integers(0, max(1, h)))
+            ang = (
+                self.angle_deg
+                + float(rng.uniform(-self.second_angle_extra_deg, self.second_angle_extra_deg))
+                + (self.crosshatch_deg * 0.5 if rng.random() < 0.35 else 0.0)
+            )
+            ln = (
+                float(self.length)
+                * self.length_boost
+                * self.second_length_scale
+                * float(rng.uniform(0.55, 1.05))
+            )
+            theta = np.deg2rad(ang)
+            dx = int(round(ln * np.cos(theta)))
+            dy = int(round(ln * np.sin(theta)))
+            x2 = int(max(0, min(w - 1, x + dx)))
+            y2 = int(max(0, min(h - 1, y + dy)))
+            col = color_dim if rng.random() < 0.42 else color_light
+            wline = max(1, int(self.thickness) - 1)
+            draw.line([(x, y), (x2, y2)], fill=col, width=wline)
+        noisy = transforms.ToTensor()(img_pil).to(dtype=torch.float32)
+        img_f = img.detach().float()
+        if noisy.device != img_f.device:
+            noisy = noisy.to(img_f.device)
+        if self.linf_fill > 0.0:
+            d = noisy - img_f
+            mx = float(d.abs().max().item())
+            e = float(self.linf_fill)
+            if mx > 1e-8 and mx < e:
+                d = d * (e / mx)
+                d = d.clamp(-e, e)
+                noisy = (img_f + d).clamp(0.0, 1.0)
+        return noisy.to(dtype=img.dtype).clamp(0.0, 1.0)
 
 
 def compute_perturbation_metrics_from_pairs(clean_imgs: List[torch.Tensor], adv_imgs: List[torch.Tensor]) -> Dict[str, float]:
@@ -187,7 +455,7 @@ def evaluate_noise_once(
     noise_name: str = "noise",
     output_dir: Optional[str] = None,
     save_preview_n: int = 5,
-    linf_eps: float = 0.05,
+    linf_cap: float = 0.05,
 ) -> Dict:
     total_samples = len(dataset)
     num_eval = min(int(num_eval), total_samples)
@@ -231,7 +499,7 @@ def evaluate_noise_once(
         pred_boxes_c = fp_c["boxes"].cpu()
 
         img_noisy = noise_transform(img_tensor).to(device)
-        img_noisy = apply_linf_noise_cap(img_clean, img_noisy, float(linf_eps))
+        img_noisy = apply_linf_noise_cap(img_clean, img_noisy, float(linf_cap))
         if (
             int(save_preview_n) > 0
             and output_dir
@@ -327,14 +595,24 @@ def run_noise_experiment(
     log_every: int,
     output_dir: str,
     save_preview_n: int = 5,
-    linf_eps: float = 0.05,
+    linf_base: float = 0.05,
+    linf_cap: float = 0.05,
 ):
     os.makedirs(output_dir, exist_ok=True)
     print(f"\n{'#' * 60}")
     print(f"噪声类型：{noise_name}（YOLO）")
     print(f"{'#' * 60}")
-    if float(linf_eps) > 0.0:
-        print(f"  L∞ 扰动上限 |x'-x|_∞ ≤ {float(linf_eps)}（与对抗 eps 语义一致）", flush=True)
+    if float(linf_cap) > 0.0:
+        if abs(float(linf_cap) - float(linf_base)) > 1e-8:
+            print(
+                f"  L∞ 裁剪 |x'-x|_∞≤{float(linf_cap):.4f}（基线 linf_eps={float(linf_base):.4f}；高斯/椒盐原生；椒盐块+显著性；雨丝后裁剪）",
+                flush=True,
+            )
+        else:
+            print(
+                f"  L∞ |x'-x|_∞≤{float(linf_cap):.4f}（高斯/椒盐原生；椒盐块+显著性；雨丝后裁剪）",
+                flush=True,
+            )
     else:
         print("  L∞ 扰动上限：无（--linf_eps≤0，与旧版无约束一致）", flush=True)
     if int(save_preview_n) > 0:
@@ -362,7 +640,7 @@ def run_noise_experiment(
             noise_name=noise_name,
             output_dir=output_dir,
             save_preview_n=save_preview_n,
-            linf_eps=float(linf_eps),
+            linf_cap=float(linf_cap),
         )
         results.append(r)
         print(f"\n第 {run_id} 次结果 [{noise_name}]：")
@@ -379,7 +657,7 @@ def run_noise_experiment(
     with open(report_file, "w", encoding="utf-8") as f:
         f.write(f"YOLO 噪声实验报告：{noise_name}\n")
         f.write("=" * 60 + "\n")
-        f.write(f"runs={num_runs}, num_eval={num_eval}, conf={conf_thresh}, iou={iou_thresh}, linf_eps={linf_eps}\n")
+        f.write(f"runs={num_runs}, num_eval={num_eval}, conf={conf_thresh}, iou={iou_thresh}, linf_base={linf_base}, linf_cap={linf_cap}\n")
         if int(save_preview_n) > 0:
             prev = os.path.join(output_dir, "noise_previews", _safe_noise_dir_name(noise_name))
             f.write(f"noise_preview_png: 前{int(save_preview_n)}张 -> {prev}/\n")
@@ -421,21 +699,147 @@ def main():
         "--gaussian_sigma",
         type=float,
         default=0.10,
-        help="高斯噪声标准差（与 ToTensor 后 [0,1] 同量纲）；略增大可明显提高漏检型 ASR",
+        help="高斯噪声：无 L∞ 时为加性标准差；有 --linf_eps 时为 N(0,σ²) 再截断到 ±linf_eps 前的 σ（σ 越大越易贴满 ±ε）",
     )
     parser.add_argument(
         "--salt_pepper_p",
         type=float,
         default=0.05,
-        help="椒盐噪声像素比例（越大越强，易超 ε 语义但作鲁棒性对比常用）",
+        help="椒盐比例：无 L∞ 时为 0/1 翻转；有 --linf_eps 时为 ±linf_eps（逐像素或块，见 --salt_block_size）",
     )
-    parser.add_argument("--rain_drop_count", type=int, default=1200, help="雨丝条数")
+    parser.add_argument(
+        "--salt_block_size",
+        type=int,
+        default=1,
+        help="L∞ 椒盐：>1 时按 B×B 整块 ±ε（对 CNN 比孤立像素强），建议 8~16 配合 --salt_pepper_p",
+    )
+    parser.add_argument(
+        "--salt_block_lowfreq",
+        type=int,
+        default=4,
+        help="椒盐块显著性权重上：>1 时在粗网格随机场上采样再乘权重，使块成簇（类高斯 lowfreq）；1 关闭",
+    )
+    parser.add_argument(
+        "--salt_block_gain",
+        type=float,
+        default=1.07,
+        help="椒盐显著性模式下块数 k 再乘该系数（略增覆盖以提高 ASR）",
+    )
+    parser.add_argument("--rain_drop_count", type=int, default=1200, help="雨丝条数（主 pass；另有第二遍短丝）")
     parser.add_argument("--rain_intensity", type=float, default=0.35, help="雨丝 alpha 强度 0~1")
+    parser.add_argument(
+        "--rain_length",
+        type=int,
+        default=26,
+        help="雨丝线段像素长度（主 pass），略大更易跨物体",
+    )
+    parser.add_argument(
+        "--rain_drop_scale",
+        type=float,
+        default=1.06,
+        help="雨丝梯度模式下相对 --rain_drop_count 的抽样条数比例",
+    )
+    parser.add_argument(
+        "--rain_crosshatch_frac",
+        type=float,
+        default=0.72,
+        help="主 pass 前若干条加 cross 大角度",
+    )
+    parser.add_argument(
+        "--rain_dark_frac",
+        type=float,
+        default=0.48,
+        help="主 pass 前若干条用略暗 RGB",
+    )
+    parser.add_argument(
+        "--gaussian_lowfreq",
+        type=int,
+        default=1,
+        help="L∞ 高斯：>1 时先在低分辨率生成噪声再上采样，结构性更强（试 8~12 提高 ASR）",
+    )
+    parser.add_argument(
+        "--rain_linf_boost",
+        type=float,
+        default=1.0,
+        help="雨丝：等效强度=min(1, intensity×boost)，L∞ 裁剪前画更亮（试 2~3）",
+    )
+    parser.add_argument(
+        "--rain_thickness",
+        type=int,
+        default=1,
+        help="雨丝线宽（像素），L∞ 下建议 4~8 提高被裁剪后仍覆盖的笔画面积",
+    )
+    parser.add_argument(
+        "--salt_cap_max",
+        type=float,
+        default=0.09,
+        help="椒盐 L∞ 裁剪绝对上限（与 linf_eps×salt_linf_mult 取 min）",
+    )
+    parser.add_argument(
+        "--rain_cap_max",
+        type=float,
+        default=0.12,
+        help="雨丝 L∞ 目标/裁剪上限（与 linf_eps×rain_linf_mult 取 min）；PIL 半透明时实际 L∞ 常远小于 cap，见 --rain_linf_fill",
+    )
     parser.add_argument(
         "--linf_eps",
         type=float,
         default=0.05,
-        help="加噪后扰动 L∞ 上限 |x'-x|_∞≤该值，再裁剪到[0,1]；与对抗攻击 eps 对齐。≤0 关闭限制（旧行为）",
+        help="基线 L∞ 上限（高斯截断/报告对齐）；椒盐原生 ± 与雨丝后裁剪可单独高于该值，见 --salt_linf_mult / --rain_linf_mult。≤0 关闭",
+    )
+    parser.add_argument(
+        "--salt_linf_mult",
+        type=float,
+        default=1.32,
+        help="仅椒盐：L∞ 裁剪=min(--salt_cap_max, linf_eps×该倍数)；与 salt_l2_exp/salt_p_gain 联调",
+    )
+    parser.add_argument(
+        "--rain_linf_mult",
+        type=float,
+        default=1.92,
+        help="仅雨丝：rain_cap=min(--rain_cap_max, linf_eps×该倍数)。若日志里 LinfCap≈0.055 说明未同步本脚本（旧版 mult≈1.1）",
+    )
+    parser.add_argument(
+        "--salt_l2_exp",
+        type=float,
+        default=2.32,
+        help="椒盐 p_eff 中 (linf_eps/salt_cap) 的指数；>2 相对平方更压 per-pixel L2，常配合 --salt_p_gain",
+    )
+    parser.add_argument(
+        "--salt_p_gain",
+        type=float,
+        default=1.26,
+        help="椒盐在 L2 缩放后再乘该增益以提高 ASR（随机噪声不保证固定百分比）",
+    )
+    parser.add_argument(
+        "--rain_l2_exp",
+        type=float,
+        default=2.02,
+        help="雨丝条数缩放中 (linf_eps/rain_cap) 的指数；略接近 2 在 rain_cap 变大时保留更多条数",
+    )
+    parser.add_argument(
+        "--rain_drop_gain",
+        type=float,
+        default=1.55,
+        help="雨丝条数再乘该增益（配合更高 L∞ cap）",
+    )
+    parser.add_argument(
+        "--rain_second_pass",
+        type=float,
+        default=0.45,
+        help="雨丝第二遍短丝条数 = 主 pass 条数×该比例（全图均匀）；略降以减耗时",
+    )
+    parser.add_argument(
+        "--rain_max_primary_drops",
+        type=int,
+        default=7500,
+        help="主 pass 条数上限（0 不限制）；count 很大时可明显加速",
+    )
+    parser.add_argument(
+        "--rain_linf_fill",
+        type=float,
+        default=-1.0,
+        help="雨丝画完后将 |x'-x|_∞ 拉至该值（≤0 则用雨丝 LinfCap）。解决 PIL 半透明导致报告 Linf 远小于 cap",
     )
     parser.add_argument(
         "--noise_preview_n",
@@ -444,6 +848,7 @@ def main():
         help="每种噪声保存前 N 张加噪图 PNG 到 outdir/noise_previews/...；0 关闭",
     )
     args = parser.parse_args()
+    print(f"噪声实验脚本: {os.path.abspath(__file__)}", flush=True)
     if float(args.linf_eps) > 0.05:
         print(f"linf_eps={args.linf_eps} 超过 0.05，已截断为 0.05（与项目对抗上限一致）", flush=True)
         args.linf_eps = 0.05
@@ -456,8 +861,37 @@ def main():
         flush=True,
     )
     le = float(args.linf_eps)
+    salt_mult = max(1.0, float(args.salt_linf_mult))
+    rain_mult = max(1.0, float(args.rain_linf_mult))
+    sp = float(args.salt_pepper_p)
     if le > 0:
-        print(f"L∞ 扰动上限 linf_eps={le}（加噪后再将 |x'-x|_∞ 压到此半径内）", flush=True)
+        salt_cap_max = max(le, min(0.12, float(args.salt_cap_max)))
+        rain_cap_max = max(le, min(0.15, float(args.rain_cap_max)))
+        salt_le = min(salt_cap_max, le * salt_mult)
+        rain_le = min(rain_cap_max, le * rain_mult)
+        salt_l2_exp = max(1.5, min(3.5, float(args.salt_l2_exp)))
+        rain_l2_exp = max(1.5, min(3.5, float(args.rain_l2_exp)))
+        p_salt = min(1.0, sp * (le / max(salt_le, 1e-12)) ** salt_l2_exp * float(args.salt_p_gain))
+        rain_drop_l2 = (le / max(rain_le, 1e-12)) ** rain_l2_exp * float(args.rain_drop_gain)
+    else:
+        salt_le = 0.0
+        rain_le = 0.0
+        p_salt = sp
+        rain_drop_l2 = 1.0
+
+    rain_fill = 0.0
+    if le > 0:
+        rain_fill = float(rain_le)
+        if float(args.rain_linf_fill) > 0.0:
+            rain_fill = min(float(rain_le), float(args.rain_linf_fill))
+
+    if le > 0:
+        print(
+            f"L∞ 基线 linf_eps={le}；椒盐 cap={salt_le:.4f}（×{salt_mult:.3f}），p_eff≈{p_salt:.4f}（exp={salt_l2_exp:.2f}×gain={float(args.salt_p_gain):.2f}）；"
+            f"雨丝 cap={rain_le:.4f}（×{rain_mult:.3f}），LinfFill={rain_fill:.4f}，条数×{float(args.rain_drop_scale) * rain_drop_l2:.3f}（exp={rain_l2_exp:.2f}×gain={float(args.rain_drop_gain):.2f}）；"
+            f"高斯仍用基线 ±{le}。",
+            flush=True,
+        )
     else:
         print("L∞ 扰动上限：关闭（--linf_eps≤0）", flush=True)
 
@@ -467,16 +901,56 @@ def main():
     model = build_yolo_voc_model(device, weights=args.load_model)
 
     gs = float(args.gaussian_sigma)
-    sp = float(args.salt_pepper_p)
     rd = int(args.rain_drop_count)
     ri = float(args.rain_intensity)
+    lf = max(1, int(args.gaussian_lowfreq))
+    rb = float(args.rain_linf_boost)
+    sb = max(1, int(args.salt_block_size))
+    sblf = max(1, int(args.salt_block_lowfreq))
+    rds = float(args.rain_drop_scale)
+    rcf = float(min(1.0, max(0.0, args.rain_crosshatch_frac)))
+    rt = max(1, int(args.rain_thickness))
+    sbg = float(min(1.35, max(0.85, args.salt_block_gain)))
+    rdf = float(min(1.0, max(0.0, args.rain_dark_frac)))
+    rmn = max(0, int(args.rain_max_primary_drops))
+    rln = max(8, int(args.rain_length))
+    rsp = float(min(1.0, max(0.0, args.rain_second_pass)))
     noise_configs = [
-        (f"高斯噪声(sigma={gs})", AddGaussianNoise(sigma=gs)),
-        (f"椒盐噪声(p={sp})", AddSaltPepperNoise(p=sp)),
-        (f"雨丝噪声(count={rd},intensity={ri})", AddRainNoise(drop_count=rd, length=18, intensity=ri)),
+        (f"高斯噪声(sigma={gs},lowfreq={lf})", AddGaussianNoise(sigma=gs, linf_eps=le, lowfreq_downscale=lf), le),
+        (
+            f"椒盐噪声(p_cmd={sp},p_eff={p_salt:.4f},block={sb},lfBlk={sblf},blkGain={sbg:.2f},chSign,LinfCap={salt_le:.4f},salience)",
+            AddSaltPepperNoise(
+                p=p_salt,
+                linf_eps=salt_le,
+                block_size=sb,
+                salience_weighted_blocks=True,
+                block_mask_lowfreq=sblf,
+                block_count_gain=sbg,
+            ),
+            salt_le if le > 0 else 0.0,
+        ),
+        (
+            f"雨丝噪声(count={rd},len={rln},intensity={ri},rainBoost={rb},thick={rt},LinfCap={rain_le:.4f},LinfFill={rain_fill:.4f},maxPrim={rmn},gradDrops×{rds * rain_drop_l2:.3f},cross={rcf:.2f},2nd={rsp:.2f},dark={rdf:.2f})",
+            AddRainNoise(
+                drop_count=rd,
+                length=rln,
+                thickness=rt,
+                intensity=ri,
+                linf_boost=rb,
+                grad_weighted_starts=True,
+                drop_scale_with_grad=rds,
+                extra_drop_l2_scale=rain_drop_l2,
+                crosshatch_frac=rcf,
+                dark_line_frac=rdf,
+                second_pass_frac=rsp,
+                linf_fill=rain_fill,
+                rain_max_primary_drops=rmn,
+            ),
+            rain_le if le > 0 else 0.0,
+        ),
     ]
 
-    for noise_name, noise_fn in noise_configs:
+    for noise_name, noise_fn, linf_cap in noise_configs:
         run_noise_experiment(
             model=model,
             dataset=ds,
@@ -491,7 +965,8 @@ def main():
             log_every=args.log_every,
             output_dir=args.outdir,
             save_preview_n=int(args.noise_preview_n),
-            linf_eps=float(args.linf_eps),
+            linf_base=le,
+            linf_cap=float(linf_cap),
         )
 
     print("\n所有 YOLO 噪声实验完成。")
